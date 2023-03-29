@@ -176,6 +176,28 @@ impl<'a> Builder<'a> {
         }
     }
 
+    /// Skip bootloader comms initialization
+    ///
+    /// This can be useful if you've already communicated with
+    /// the bootloader and need to send new commands.  To be
+    /// successful you must use the same baud rate as the
+    /// original session
+    pub fn skip_initialization(self) -> anyhow::Result<AN3155> {
+        let path = self.path;
+        let baud_rate = self.baud_rate.unwrap_or(DEFAULT_BAUDRATE);
+        info!("opening serial port: {path} {baud_rate} 8E1");
+        let mut serial = serialport::new(path, baud_rate)
+            .parity(serialport::Parity::Even)
+            .stop_bits(serialport::StopBits::One)
+            .data_bits(serialport::DataBits::Eight)
+            .timeout(Duration::from_secs(1))
+            .open()
+            .context("Failed to open serialport device")?;
+
+        Ok(AN3155 { serial })
+    }
+
+    /// Initialize comms with the bootloader
     pub fn initialize(self) -> anyhow::Result<AN3155> {
         let path = self.path;
         let baud_rate = self.baud_rate.unwrap_or(DEFAULT_BAUDRATE);
@@ -246,16 +268,6 @@ impl AN3155 {
         self.serial.read_exact(buf)?;
         debug! {"read {} bytes: {:02X?}", buf.len(), &buf};
         Ok(())
-        // let mut n = 0;
-        // while n < buf.len() {
-        //     let n_bytes = self.read(&mut buf[n..])?;
-        //     n += n_bytes;
-        // }
-        // if n != buf.len() {
-        //     Err(IoError::from(IoErrorKind::UnexpectedEof).into())
-        // } else {
-        //     Ok(())
-        // }
     }
 
     fn read_byte(&mut self) -> anyhow::Result<u8> {
@@ -298,6 +310,22 @@ impl AN3155 {
         Ok(Version::from(byte))
     }
 
+    /// Get product ID
+    pub fn get_id(&mut self) -> anyhow::Result<u16> {
+        info!("getting product id");
+        self.write_command(BootloaderCommand::GetId)
+            .context("Failed to send GetId command")?;
+        self.read_ack()?;
+        let n = self.read_byte()? as usize;
+
+        let mut buf = Vec::with_capacity(n + 1);
+        buf.resize(n + 1, 0);
+
+        info!("receiving PID");
+        self.read_exact(&mut buf)?;
+        Ok(u16::from_be_bytes(buf[0..2].try_into().unwrap()))
+    }
+
     /// Get the bootloader commands
     pub fn get_commands(&mut self) -> anyhow::Result<Vec<BootloaderCommand>> {
         info!("getting bootloader command set");
@@ -307,17 +335,17 @@ impl AN3155 {
 
         let n = self
             .read_byte()
-            .context("Failed to read protocol version byte")?;
+            .context("Failed to read protocol version byte")? as usize;
 
         let mut buf = Vec::with_capacity(n as usize);
-        buf.resize(n as usize, 0);
+        buf.resize(n + 1, 0);
         self.read_exact(&mut buf)
             .context("Failed to read bootloader command list")?;
         self.read_ack()?;
-        let mut commands: Vec<BootloaderCommand> = Vec::with_capacity(n as usize);
-        for b in buf {
+        let mut commands: Vec<BootloaderCommand> = Vec::with_capacity(buf.len() - 1);
+        for b in buf.iter().skip(1) {
             commands.push(
-                BootloaderCommand::try_from(b)
+                BootloaderCommand::try_from(*b)
                     .context("Bootloader returned an unknown command value")?,
             );
         }
