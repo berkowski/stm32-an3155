@@ -1,0 +1,12 @@
+[package]
+name = "stm32-an3155"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+serialport = {version = "4", default-features = false}
+anyhow = "1"
+thiserror = "1"
+

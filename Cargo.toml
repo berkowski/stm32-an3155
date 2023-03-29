@@ -1,12 +1,2 @@
-[package]
-name = "stm32-an3155"
-version = "0.1.0"
-edition = "2021"
-description = "STM32 firmware flasher using USART protocol defined in AN3155"
-
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
-
-[dependencies]
-serialport = {version = "4", default-features = false}
-clap = {version = "4", features = ["derive"]}
-
+[workspace]
+members = ["stm32-an3155", "stm32-an3155-bin"]
