@@ -316,10 +316,16 @@ impl AN3155 {
         self.write_command(BootloaderCommand::GetId)
             .context("Failed to send GetId command")?;
         self.read_ack()?;
+        trace! {"reading byte, expecting it to be '1'"};
         let n = self.read_byte()? as usize;
+        // n should be 1, we expect to read two bytes here
+        if n != 1 {
+            return Err(anyhow::Error::from(Error::InvalidResponse(n as u8))
+                .context("Expected two bytes for product ID"));
+        }
 
-        let mut buf = Vec::with_capacity(n + 1);
-        buf.resize(n + 1, 0);
+        let mut buf = Vec::with_capacity(2);
+        buf.resize(2, 0);
 
         info!("receiving PID");
         self.read_exact(&mut buf)?;
