@@ -29,6 +29,7 @@ enum Command {
 }
 
 fn main() -> anyhow::Result<()> {
+    env_logger::init();
     let cli = Opt::parse();
 
     let mut an3155 = Builder::with_port(&cli.port)

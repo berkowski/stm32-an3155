@@ -1,4 +1,5 @@
 use anyhow::Context;
+use log::{debug, error, info, trace, warn};
 use thiserror::Error as ThisError;
 
 use std::{
@@ -7,6 +8,7 @@ use std::{
     io::{Error as IoError, ErrorKind as IoErrorKind},
     marker::PhantomData,
     path::Path,
+    time::Duration,
 };
 
 /// Baudrate sync byte used during initialization
@@ -16,7 +18,7 @@ const SYNC_BYTE: u8 = 0x7F;
 pub const DEFAULT_BAUDRATE: u32 = 57_600;
 
 #[repr(u8)]
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BootloaderCommand {
     /// Gets the version and the allowed commands supported by the current version of the protocol.
     Get = 0x00,
@@ -175,18 +177,23 @@ impl<'a> Builder<'a> {
     }
 
     pub fn initialize(self) -> anyhow::Result<AN3155> {
-        let Builder { path, baud_rate } = self;
-        let mut serial = serialport::new(path, baud_rate.unwrap_or(DEFAULT_BAUDRATE))
+        let path = self.path;
+        let baud_rate = self.baud_rate.unwrap_or(DEFAULT_BAUDRATE);
+        info!("opening serial port: {path} {baud_rate} 8E1");
+        let mut serial = serialport::new(path, baud_rate)
             .parity(serialport::Parity::Even)
             .stop_bits(serialport::StopBits::One)
             .data_bits(serialport::DataBits::Eight)
+            .timeout(Duration::from_secs(1))
             .open()
             .context("Failed to open serialport device")?;
 
+        info!("writing baudrate sync byte");
         serial
             .write(&[SYNC_BYTE][..])
             .context("Failed to send baudrate sync byte")?;
         let mut buf = [0u8];
+        info!("waiting for bootloader response");
         serial
             .read(&mut buf[..])
             .context("Failed to read response from bootloader")?;
@@ -201,14 +208,23 @@ pub struct AN3155 {
 
 impl AN3155 {
     fn write(&mut self, bytes: &[u8]) -> anyhow::Result<usize> {
+        debug!("sending {} bytes: {:02X?}", bytes.len(), bytes);
         self.serial
             .write(bytes)
             .context("Failed to write data to serial port")
     }
 
+    fn write_command(&mut self, command: BootloaderCommand) -> anyhow::Result<()> {
+        let buf = [command as u8, !(command as u8)];
+        debug!("sending command {:?}: {:02X?}", command, &buf[..]);
+        let n = self.write(&buf[..]).context("Failed to write command")?;
+        Ok(())
+    }
+
     fn write_with_checksum(&mut self, bytes: &[u8]) -> anyhow::Result<usize> {
         let chksum = bytes.iter().fold(0u8, |acc, b| acc ^ *b);
         let n = self.write(bytes)?;
+        debug!("sending checksum value: {:02X}", chksum);
         let _ = self
             .serial
             .write(&[chksum][..])
@@ -217,18 +233,29 @@ impl AN3155 {
     }
 
     fn read(&mut self, buf: &mut [u8]) -> anyhow::Result<usize> {
-        self.serial
+        let n = self
+            .serial
             .read(buf)
-            .context("Failed to read from serialport")
+            .context("Failed to read from serialport")?;
+        debug! {"read {} bytes: {:02X?}", n, &buf[..n]};
+        Ok(n)
     }
 
     fn read_exact(&mut self, buf: &mut [u8]) -> anyhow::Result<()> {
-        let n = self.read(buf)?;
-        if n != buf.len() {
-            Err(IoError::from(IoErrorKind::UnexpectedEof).into())
-        } else {
-            Ok(())
-        }
+        debug!("reading exactly {} bytes", buf.len());
+        self.serial.read_exact(buf)?;
+        debug! {"read {} bytes: {:02X?}", buf.len(), &buf};
+        Ok(())
+        // let mut n = 0;
+        // while n < buf.len() {
+        //     let n_bytes = self.read(&mut buf[n..])?;
+        //     n += n_bytes;
+        // }
+        // if n != buf.len() {
+        //     Err(IoError::from(IoErrorKind::UnexpectedEof).into())
+        // } else {
+        //     Ok(())
+        // }
     }
 
     fn read_byte(&mut self) -> anyhow::Result<u8> {
@@ -238,22 +265,32 @@ impl AN3155 {
     }
 
     fn read_ack(&mut self) -> anyhow::Result<()> {
+        debug!("reading bootloader response");
         let byte = self.read_byte()?;
         match Response::try_from(byte).context("Failed to read valid response from bootloader")? {
-            Response::Ack => Ok(()),
-            Response::Nack => Err(Error::Nack.into()),
+            Response::Ack => {
+                debug!("received ACK");
+                Ok(())
+            }
+            Response::Nack => {
+                warn!("received NACK");
+                Err(Error::Nack.into())
+            }
         }
     }
 
     /// Get the bootloader version
     pub fn get_version(&mut self) -> anyhow::Result<Version> {
-        self.write_with_checksum(&[BootloaderCommand::GetVersion as u8][..])
+        info!("getting bootloader version");
+        self.write_command(BootloaderCommand::GetVersion)
             .context("Failed to send GetVersion command")?;
         self.read_ack()?;
+        info!("reading protocol version byte");
         let byte = self
             .read_byte()
             .context("Failed to read protocol version byte")?;
 
+        info!("reading capatability bytes");
         let mut buf = [0u8, 0u8];
         self.read_exact(&mut buf)
             .context("Failed to read compatability bytes")?;
@@ -263,7 +300,8 @@ impl AN3155 {
 
     /// Get the bootloader commands
     pub fn get_commands(&mut self) -> anyhow::Result<Vec<BootloaderCommand>> {
-        self.write_with_checksum(&[BootloaderCommand::Get as u8][..])
+        info!("getting bootloader command set");
+        self.write_command(BootloaderCommand::Get)
             .context("Failed to send Get command")?;
         self.read_ack()?;
 

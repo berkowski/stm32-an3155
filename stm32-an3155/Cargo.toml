@@ -9,4 +9,5 @@ edition = "2021"
 serialport = {version = "4", default-features = false}
 anyhow = "1"
 thiserror = "1"
+log = "0.4"
 

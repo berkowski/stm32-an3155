@@ -11,3 +11,4 @@ anyhow = "1"
 serialport = {version = "4", default-features = false}
 clap = {version = "4", features = ["derive"]}
 stm32-an3155 = {path = "../stm32-an3155"}
+env_logger = "0.10"
