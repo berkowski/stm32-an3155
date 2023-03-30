@@ -447,11 +447,16 @@ impl AN3155 {
 
         // create a buffer with all u16 page values converted to
         // BE bytes
-        let mut buf = Vec::with_capacity(2 * (n + 1) as usize);
-        buf.resize((2 * n) as usize, 0x00);
+        let mut buf = Vec::with_capacity((2 * (n + 1) + 1) as usize);
+        buf.resize((2 * (n + 1) + 1) as usize, 0x00);
+        // insert BE number of pages here
+
+        // Then insert pages
         buf.chunks_mut(2).enumerate().for_each(|(index, chunk)| {
             chunk.copy_from_slice(&pages[index].to_be_bytes()[..]);
         });
+
+        // then insert checksum as single byte at the end
 
         // Add checksum as BE bytes
         buf.extend_from_slice(&checksum.to_be_bytes()[..]);
