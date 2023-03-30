@@ -17,6 +17,21 @@ const SYNC_BYTE: u8 = 0x7F;
 /// Default baud rate
 pub const DEFAULT_BAUDRATE: u32 = 57_600;
 
+/// Maximum number of pages that can be erased in a single standard erase command
+pub const MAX_ERASE_PAGE_COUNT: usize = u8::MAX as usize;
+
+/// Maximum number of bytes that can be written in a single write memory command
+pub const MAX_WRITE_BYTES_COUNT: usize = u8::MAX as usize + 1;
+
+/// Maximum number of bytes that can be read in a single write memory command
+pub const MAX_READ_BYTES_COUNT: usize = u8::MAX as usize + 1;
+
+/// Default page size in bytes
+pub const DEFAULT_PAGE_SIZE: usize = 128;
+
+/// Default starting target address
+pub const DEFAULT_START_ADDRESS: u32 = 0x0800_0000;
+
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BootloaderCommand {
@@ -85,6 +100,18 @@ pub enum Response {
     Nack = 0x1F,
 }
 
+impl TryFrom<u8> for Response {
+    type Error = Error;
+
+    fn try_from(v: u8) -> Result<Self, Self::Error> {
+        match v {
+            0x79 => Ok(Self::Ack),
+            0x1F => Ok(Self::Nack),
+            _ => Err(Error::InvalidResponse(v)),
+        }
+    }
+}
+
 /// Type of erase command used on chip
 ///
 /// Each chip's bootloader will support either the Erase command or
@@ -96,16 +123,14 @@ pub enum EraseCommand {
     ExtendedErase,
 }
 
-impl TryFrom<u8> for Response {
-    type Error = Error;
-
-    fn try_from(v: u8) -> Result<Self, Self::Error> {
-        match v {
-            0x79 => Ok(Self::Ack),
-            0x1F => Ok(Self::Nack),
-            _ => Err(Error::InvalidResponse(v)),
-        }
-    }
+/// Extended Erase global erase target
+pub enum BankErase {
+    /// Erase all banks
+    Global,
+    /// Erase only bank 1
+    Bank1,
+    /// Erase only bank 2
+    Bank2,
 }
 
 #[derive(ThisError, Debug)]
@@ -121,6 +146,12 @@ pub enum Error {
 
     #[error("unsupported operation")]
     Unsupported,
+
+    #[error("Erase command supports only up to 254 pages.  Provided {0}")]
+    ErasePageCount(usize),
+
+    #[error("Write command supports only up to 256 bytes.  Provided {0}")]
+    WriteBytesCount(usize),
 }
 
 /// Bootloader version
@@ -236,11 +267,16 @@ impl AN3155 {
             .context("Failed to write data to serial port")
     }
 
+    /// Write a bootloader command and wait for a response
     fn write_command(&mut self, command: BootloaderCommand) -> anyhow::Result<()> {
         let buf = [command as u8, !(command as u8)];
         debug!("sending command {:?}: {:02X?}", command, &buf[..]);
         let n = self.write(&buf[..]).context("Failed to write command")?;
-        Ok(())
+        if n != 2 {
+            return Err(IoError::from(IoErrorKind::WriteZero).into());
+        }
+
+        self.read_ack()
     }
 
     fn write_with_checksum(&mut self, bytes: &[u8]) -> anyhow::Result<usize> {
@@ -296,7 +332,6 @@ impl AN3155 {
         info!("getting bootloader version");
         self.write_command(BootloaderCommand::GetVersion)
             .context("Failed to send GetVersion command")?;
-        self.read_ack()?;
         info!("reading protocol version byte");
         let byte = self
             .read_byte()
@@ -315,7 +350,6 @@ impl AN3155 {
         info!("getting product id");
         self.write_command(BootloaderCommand::GetId)
             .context("Failed to send GetId command")?;
-        self.read_ack()?;
         trace! {"reading byte, expecting it to be '1'"};
         let n = self.read_byte()? as usize;
         // n should be 1, we expect to read two bytes here
@@ -337,7 +371,6 @@ impl AN3155 {
         info!("getting bootloader command set");
         self.write_command(BootloaderCommand::Get)
             .context("Failed to send Get command")?;
-        self.read_ack()?;
 
         let n = self
             .read_byte()
@@ -358,7 +391,7 @@ impl AN3155 {
         Ok(commands)
     }
 
-    fn get_erase_command(&mut self) -> anyhow::Result<EraseCommand> {
+    pub fn get_erase_command(&mut self) -> anyhow::Result<EraseCommand> {
         let commands = self
             .get_commands()
             .context("Failed to get bootloader command list")?;
@@ -370,5 +403,130 @@ impl AN3155 {
         } else {
             Err(Error::Unsupported.into())
         }
+    }
+
+    /// Standard erase command
+    pub fn standard_erase(&mut self, pages: &[u8]) -> anyhow::Result<()> {
+        if pages.is_empty() {
+            warn! {"no pages to erase, doing nothing"};
+            return Ok(());
+        }
+
+        if pages.len() > MAX_ERASE_PAGE_COUNT {
+            return Err(Error::ErasePageCount(pages.len()).into());
+        }
+
+        let n = (pages.len() - 1) as u8;
+        let checksum = pages.iter().fold(n, |acc, page| acc ^ page);
+        self.write_command(BootloaderCommand::Erase)?;
+
+        debug! {"sending number of pages to erase"};
+        self.write(&[n][..])?;
+        debug! {"sending list of pages to erase"};
+        self.write(pages)?;
+        debug! {"sending checksum"};
+        self.write(&[checksum][..])?;
+        self.serial.flush()?;
+
+        self.read_ack()
+    }
+
+    /// Global erase with standard erase command
+    pub fn standard_global_erase(&mut self) -> anyhow::Result<()> {
+        self.write_command(BootloaderCommand::Erase)?;
+        self.write(&[0xFF, 0x00][..])?;
+        self.serial.flush()?;
+        self.read_ack()
+    }
+
+    /// Extended erase command
+    pub fn extended_erase(&mut self, pages: &[u16]) -> anyhow::Result<()> {
+        let n = pages.len() as u16;
+        // calulate checksum
+        let checksum = pages.iter().fold(n, |acc, b| acc ^ b);
+
+        // create a buffer with all u16 page values converted to
+        // BE bytes
+        let mut buf = Vec::with_capacity(2 * (n + 1) as usize);
+        buf.resize((2 * n) as usize, 0x00);
+        buf.chunks_mut(2).enumerate().for_each(|(index, chunk)| {
+            chunk.copy_from_slice(&pages[index].to_be_bytes()[..]);
+        });
+
+        // Add checksum as BE bytes
+        buf.extend_from_slice(&checksum.to_be_bytes()[..]);
+
+        self.write_command(BootloaderCommand::ExtendedErase)?;
+        self.write(&buf)?;
+        self.serial.flush()?;
+        self.read_ack()
+    }
+
+    /// Global erase with standard erase command
+    pub fn extended_global_erase(&mut self, bank: BankErase) -> anyhow::Result<()> {
+        let buf = match bank {
+            BankErase::Global => &[0xFF, 0xFF, 0x00][..],
+            BankErase::Bank1 => &[0xFF, 0xFE, 0x01][..],
+            BankErase::Bank2 => &[0xFF, 0xFD, 0x02][..],
+        };
+
+        self.write_command(BootloaderCommand::ExtendedErase)?;
+        self.write(buf)?;
+        self.serial.flush()?;
+        self.read_ack()
+    }
+
+    pub fn write_memory(&mut self, address: u32, bytes: &[u8]) -> anyhow::Result<()> {
+        info! {"writing {} bytes to memory starting at address: {:08X}", bytes.len(), address};
+        if bytes.is_empty() {
+            warn! {"no bytes to write, doing nothing"};
+            return Ok(());
+        }
+
+        if bytes.len() > MAX_WRITE_BYTES_COUNT {
+            return Err(Error::WriteBytesCount(bytes.len()).into());
+        }
+        let address_as_bytes = address.to_be_bytes();
+
+        self.write_command(BootloaderCommand::WriteMemory)?;
+        self.write_with_checksum(&address_as_bytes[..])?;
+        self.serial.flush()?;
+        self.read_ack()?;
+
+        let n = bytes.len() as u8 - 1;
+        let checksum = bytes.iter().fold(n, |acc, b| acc ^ b);
+        self.write(&[n][..])?;
+        self.write(bytes)?;
+        self.write(&[checksum][..])?;
+        self.read_ack()
+    }
+
+    pub fn read_memory(&mut self, address: u32, bytes: &mut [u8]) -> anyhow::Result<()> {
+        info! {"reading {} bytes to memory starting at address: {:08X}", bytes.len(), address};
+        if bytes.is_empty() {
+            warn! {"no bytes to read, doing nothing"};
+            return Ok(());
+        }
+
+        if bytes.len() > MAX_READ_BYTES_COUNT {
+            return Err(Error::WriteBytesCount(bytes.len()).into());
+        }
+        let address_as_bytes = address.to_be_bytes();
+
+        self.write_command(BootloaderCommand::WriteMemory)?;
+        self.write_with_checksum(&address_as_bytes[..])?;
+        self.serial.flush()?;
+        self.read_ack()?;
+
+        let n = bytes.len() as u8 - 1;
+        let checksum = !n;
+        let mut buf: Vec<u8> = Vec::with_capacity((n + 1) as usize);
+        buf.resize((n + 1) as usize, 0);
+        self.write(&[n][..])?;
+        self.write(&[checksum][..])?;
+        self.serial.flush()?;
+
+        self.read_exact(&mut buf)?;
+        self.read_ack()
     }
 }
