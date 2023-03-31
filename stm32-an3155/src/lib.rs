@@ -445,14 +445,15 @@ impl AN3155 {
             warn! {"no pages to erase, doing nothing"};
             return Ok(());
         }
-        let n = pages.len() as u16;
+        let num_pages = pages.len() as u16;
 
         // create a buffer with all u16 page values converted to BE bytes
-        let mut buf = Vec::with_capacity((2 * (n + 1) + 1) as usize);
+        let mut buf = Vec::with_capacity((2 * (num_pages + 1) + 1) as usize);
 
         // resize to hold number of pages and the pages themselves.
-        buf.resize((2 * (n + 1)) as usize, 0x00);
+        buf.resize((2 * (num_pages + 1)) as usize, 0x00);
 
+        let n = num_pages - 1;
         // insert BE number of pages here
         buf[..2].copy_from_slice(&n.to_be_bytes()[..]);
 
@@ -484,12 +485,13 @@ impl AN3155 {
 
     pub fn write_memory(&mut self, address: u32, bytes: &[u8]) -> anyhow::Result<()> {
         info! {"writing {} bytes to memory starting at address: {:08X}", bytes.len(), address};
-        if bytes.is_empty() {
+        let num_bytes = bytes.len();
+        if num_bytes == 0 {
             warn! {"no bytes to write, doing nothing"};
             return Ok(());
         }
 
-        if bytes.len() > MAX_WRITE_BYTES_COUNT {
+        if num_bytes > MAX_WRITE_BYTES_COUNT {
             return Err(Error::WriteBytesCount(bytes.len()).into());
         }
         let address_as_bytes = address.to_be_bytes();
@@ -499,7 +501,7 @@ impl AN3155 {
         self.serial.flush()?;
         self.read_ack()?;
 
-        let n = bytes.len() as u8 - 1;
+        let n = (num_bytes - 1) as u8;
         let checksum = bytes.iter().fold(n, |acc, b| acc ^ b);
         self.write(&[n][..])?;
         self.write(bytes)?;
@@ -519,19 +521,18 @@ impl AN3155 {
         }
         let address_as_bytes = address.to_be_bytes();
 
-        self.write_command(BootloaderCommand::WriteMemory)?;
+        self.write_command(BootloaderCommand::ReadMemory)?;
         self.write_with_checksum(&address_as_bytes[..])?;
         self.serial.flush()?;
         self.read_ack()?;
 
-        let n = bytes.len() as u8 - 1;
+        let num_bytes = bytes.len();
+        let n = (num_bytes - 1) as u8;
         let checksum = !n;
-        let mut buf: Vec<u8> = Vec::with_capacity((n + 1) as usize);
-        buf.resize((n + 1) as usize, 0);
         self.write(&[n, checksum][..])?;
         self.serial.flush()?;
+        self.read_ack()?;
 
-        self.read_exact(&mut buf)?;
-        self.read_ack()
+        self.read_exact(bytes)
     }
 }

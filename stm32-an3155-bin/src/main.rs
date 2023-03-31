@@ -137,19 +137,19 @@ fn main() -> anyhow::Result<()> {
                 an3155.write_memory(addr, chunk)?;
             }
 
-            info! {"reading back memory for verification"};
-            let mut buf: Vec<u8> = Vec::with_capacity(size as usize);
-            buf.resize(size as usize, 0);
-            for (index, chunk) in buf
-                .chunks_mut(stm32_an3155::MAX_READ_BYTES_COUNT)
-                .enumerate()
-            {
-                let addr = address + (index * stm32_an3155::MAX_WRITE_BYTES_COUNT) as u32;
-                debug! {"reading chunk #{} from address: 0x{addr:08X}", index + 1}
-                an3155.read_memory(addr, chunk)?;
-            }
-
             if !skip_verification {
+                info! {"reading back memory for verification"};
+                let mut buf: Vec<u8> = Vec::with_capacity(size as usize);
+                buf.resize(size as usize, 0);
+                for (index, chunk) in buf
+                    .chunks_mut(stm32_an3155::MAX_READ_BYTES_COUNT)
+                    .enumerate()
+                {
+                    let addr = address + (index * stm32_an3155::MAX_WRITE_BYTES_COUNT) as u32;
+                    debug! {"reading chunk #{} from address: 0x{addr:08X}", index + 1}
+                    an3155.read_memory(addr, chunk)?;
+                }
+
                 debug! {"comparing bytes with original file"};
                 for (byte, (original, written)) in bytes.iter().zip(buf.iter()).enumerate() {
                     match original.cmp(&written) {
