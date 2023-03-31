@@ -42,7 +42,7 @@ fn main() -> anyhow::Result<()> {
     env_logger::init();
     let cli = Opt::parse();
 
-    let builder = Builder::with_port(&cli.port).and_baud_rate(cli.baud_rate);
+    let builder = Builder::with_path(&cli.port).and_baud_rate(cli.baud_rate);
 
     let mut an3155 = match cli.skip_initialization {
         true => builder.skip_initialization(),

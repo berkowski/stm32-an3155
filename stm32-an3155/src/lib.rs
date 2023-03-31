@@ -1,5 +1,6 @@
 use anyhow::Context;
 use log::{debug, error, info, trace, warn};
+use mockall_double::double;
 use thiserror::Error as ThisError;
 
 use std::{
@@ -187,355 +188,389 @@ impl From<u8> for Version {
     }
 }
 
-pub struct Builder<'a> {
-    baud_rate: Option<u32>,
-    path: &'a str,
+enum PathOrSerialport {
+    Path(String),
+    Serial(Box<dyn serialport::SerialPort>),
 }
 
-impl<'a> Builder<'a> {
-    pub fn with_port(path: &'a str) -> Self {
-        Self {
-            path,
-            baud_rate: None,
-        }
+mod inner {
+    use super::*;
+    #[cfg(test)]
+    use mockall::*;
+
+    pub struct Builder {
+        baud_rate: Option<u32>,
+        path_or_serial: PathOrSerialport,
     }
 
-    pub fn and_baud_rate(self, baud_rate: u32) -> Self {
-        Self {
-            path: self.path,
-            baud_rate: Some(baud_rate),
-        }
-    }
-
-    /// Skip bootloader comms initialization
-    ///
-    /// This can be useful if you've already communicated with
-    /// the bootloader and need to send new commands.  To be
-    /// successful you must use the same baud rate as the
-    /// original session
-    pub fn skip_initialization(self) -> anyhow::Result<AN3155> {
-        let path = self.path;
-        let baud_rate = self.baud_rate.unwrap_or(DEFAULT_BAUDRATE);
-        info!("opening serial port: {path} {baud_rate} 8E1");
-        let mut serial = serialport::new(path, baud_rate)
-            .parity(serialport::Parity::Even)
-            .stop_bits(serialport::StopBits::One)
-            .data_bits(serialport::DataBits::Eight)
-            .timeout(Duration::from_secs(1))
-            .open()
-            .context("Failed to open serialport device")?;
-
-        Ok(AN3155 { serial })
-    }
-
-    /// Initialize comms with the bootloader
-    pub fn initialize(self) -> anyhow::Result<AN3155> {
-        let path = self.path;
-        let baud_rate = self.baud_rate.unwrap_or(DEFAULT_BAUDRATE);
-        info!("opening serial port: {path} {baud_rate} 8E1");
-        let mut serial = serialport::new(path, baud_rate)
-            .parity(serialport::Parity::Even)
-            .stop_bits(serialport::StopBits::One)
-            .data_bits(serialport::DataBits::Eight)
-            .timeout(Duration::from_secs(1))
-            .open()
-            .context("Failed to open serialport device")?;
-
-        info!("writing baudrate sync byte");
-        serial
-            .write(&[SYNC_BYTE][..])
-            .context("Failed to send baudrate sync byte")?;
-        let mut buf = [0u8];
-        info!("waiting for bootloader response");
-        serial
-            .read(&mut buf[..])
-            .context("Failed to read response from bootloader")?;
-
-        Ok(AN3155 { serial })
-    }
-}
-
-pub struct AN3155 {
-    serial: Box<dyn serialport::SerialPort>,
-}
-
-impl AN3155 {
-    fn write(&mut self, bytes: &[u8]) -> anyhow::Result<usize> {
-        debug!("sending {} bytes: {:02X?}", bytes.len(), bytes);
-        self.serial
-            .write(bytes)
-            .context("Failed to write data to serial port")
-    }
-
-    /// Write a bootloader command and wait for a response
-    fn write_command(&mut self, command: BootloaderCommand) -> anyhow::Result<()> {
-        let buf = [command as u8, !(command as u8)];
-        debug!("sending command {:?}: {:02X?}", command, &buf[..]);
-        let n = self.write(&buf[..]).context("Failed to write command")?;
-        if n != 2 {
-            return Err(IoError::from(IoErrorKind::WriteZero).into());
-        }
-
-        self.read_ack()
-    }
-
-    fn write_with_checksum(&mut self, bytes: &[u8]) -> anyhow::Result<usize> {
-        let chksum = bytes.iter().fold(0u8, |acc, b| acc ^ *b);
-        let n = self.write(bytes)?;
-        debug!("sending checksum value: {:02X}", chksum);
-        let _ = self
-            .serial
-            .write(&[chksum][..])
-            .context("Failed to write checksum")?;
-        Ok(n + 1)
-    }
-
-    fn read(&mut self, buf: &mut [u8]) -> anyhow::Result<usize> {
-        let n = self
-            .serial
-            .read(buf)
-            .context("Failed to read from serialport")?;
-        debug! {"read {} bytes: {:02X?}", n, &buf[..n]};
-        Ok(n)
-    }
-
-    fn read_exact(&mut self, buf: &mut [u8]) -> anyhow::Result<()> {
-        debug!("reading exactly {} bytes", buf.len());
-        self.serial.read_exact(buf)?;
-        debug! {"read {} bytes: {:02X?}", buf.len(), &buf};
-        Ok(())
-    }
-
-    fn read_byte(&mut self) -> anyhow::Result<u8> {
-        let mut byte = [0u8];
-        let _ = self.read_exact(&mut byte[..])?;
-        Ok(byte[0])
-    }
-
-    fn read_ack(&mut self) -> anyhow::Result<()> {
-        debug!("reading bootloader response");
-        let byte = self.read_byte()?;
-        match Response::try_from(byte).context("Failed to read valid response from bootloader")? {
-            Response::Ack => {
-                debug!("received ACK");
-                Ok(())
-            }
-            Response::Nack => {
-                warn!("received NACK");
-                Err(Error::Nack.into())
+    #[cfg_attr(test, automock)]
+    impl Builder {
+        /// Provide a serial port path or name to use for the interface
+        pub fn with_path(path: &str) -> Self {
+            Self {
+                path_or_serial: PathOrSerialport::Path(path.to_owned()),
+                baud_rate: None,
             }
         }
-    }
 
-    /// Get the bootloader version
-    pub fn get_version(&mut self) -> anyhow::Result<Version> {
-        info!("getting bootloader version");
-        self.write_command(BootloaderCommand::GetVersion)
-            .context("Failed to send GetVersion command")?;
-        info!("reading protocol version byte");
-        let byte = self
-            .read_byte()
-            .context("Failed to read protocol version byte")?;
-
-        info!("reading capatability bytes");
-        let mut buf = [0u8, 0u8];
-        self.read_exact(&mut buf)
-            .context("Failed to read compatability bytes")?;
-        self.read_ack()?;
-        Ok(Version::from(byte))
-    }
-
-    /// Get product ID
-    pub fn get_id(&mut self) -> anyhow::Result<u16> {
-        info!("getting product id");
-        self.write_command(BootloaderCommand::GetId)
-            .context("Failed to send GetId command")?;
-        trace! {"reading byte, expecting it to be '1'"};
-        let n = self.read_byte()? as usize;
-        // n should be 1, we expect to read two bytes here
-        if n != 1 {
-            return Err(anyhow::Error::from(Error::InvalidResponse(n as u8))
-                .context("Expected two bytes for product ID"));
+        /// Provide an already existing serial port object to use for the interface
+        pub fn with_serial(serial: Box<dyn serialport::SerialPort>) -> Self {
+            Self {
+                path_or_serial: PathOrSerialport::Serial(serial),
+                baud_rate: None,
+            }
         }
 
-        let mut buf = Vec::with_capacity(2);
-        buf.resize(2, 0);
-
-        info!("receiving PID");
-        self.read_exact(&mut buf)?;
-        Ok(u16::from_be_bytes(buf[0..2].try_into().unwrap()))
-    }
-
-    /// Get the bootloader commands
-    pub fn get_commands(&mut self) -> anyhow::Result<Vec<BootloaderCommand>> {
-        info!("getting bootloader command set");
-        self.write_command(BootloaderCommand::Get)
-            .context("Failed to send Get command")?;
-
-        let n = self
-            .read_byte()
-            .context("Failed to read protocol version byte")? as usize;
-
-        let mut buf = Vec::with_capacity(n as usize);
-        buf.resize(n + 1, 0);
-        self.read_exact(&mut buf)
-            .context("Failed to read bootloader command list")?;
-        self.read_ack()?;
-        let mut commands: Vec<BootloaderCommand> = Vec::with_capacity(buf.len() - 1);
-        for b in buf.iter().skip(1) {
-            commands.push(
-                BootloaderCommand::try_from(*b)
-                    .context("Bootloader returned an unknown command value")?,
-            );
+        pub fn and_baud_rate(self, baud_rate: u32) -> Self {
+            Self {
+                path_or_serial: self.path_or_serial,
+                baud_rate: Some(baud_rate),
+            }
         }
-        Ok(commands)
-    }
 
-    pub fn get_erase_command(&mut self) -> anyhow::Result<EraseCommand> {
-        let commands = self
-            .get_commands()
-            .context("Failed to get bootloader command list")?;
+        fn open_serialport(self) -> anyhow::Result<Box<dyn serialport::SerialPort>> {
+            let baud_rate = self.baud_rate.unwrap_or(DEFAULT_BAUDRATE);
+            match self.path_or_serial {
+                PathOrSerialport::Path(path) => {
+                    info!("opening serial port: {path} {baud_rate} 8E1");
+                    serialport::new(path, baud_rate)
+                        .parity(serialport::Parity::Even)
+                        .stop_bits(serialport::StopBits::One)
+                        .data_bits(serialport::DataBits::Eight)
+                        .timeout(Duration::from_secs(1))
+                        .open()
+                        .context("Failed to open serialport device")
+                }
+                PathOrSerialport::Serial(mut serial) => {
+                    info! {
+                        "setting serial port: {} to {baud_rate} 8E1",
+                        serial.name().unwrap_or(String::from("<UNKNOWN>"))
+                    };
+                    serial.set_baud_rate(self.baud_rate.unwrap_or(DEFAULT_BAUDRATE))?;
+                    serial.set_data_bits(serialport::DataBits::Eight)?;
+                    serial.set_parity(serialport::Parity::Even)?;
+                    serial.set_stop_bits(serialport::StopBits::One)?;
+                    Ok(serial)
+                }
+            }
+        }
 
-        if commands.contains(&BootloaderCommand::Erase) {
-            Ok(EraseCommand::Erase)
-        } else if commands.contains(&BootloaderCommand::ExtendedErase) {
-            Ok(EraseCommand::ExtendedErase)
-        } else {
-            Err(Error::Unsupported.into())
+        /// Skip bootloader comms initialization
+        ///
+        /// This can be useful if you've already communicated with
+        /// the bootloader and need to send new commands.  To be
+        /// successful you must use the same baud rate as the
+        /// original session
+        pub fn skip_initialization(self) -> anyhow::Result<AN3155> {
+            let serial = self.open_serialport()?;
+            Ok(AN3155 { serial })
+        }
+
+        /// Initialize comms with the bootloader
+        pub fn initialize(self) -> anyhow::Result<AN3155> {
+            let mut serial = self.open_serialport()?;
+            info!("writing baudrate sync byte");
+            serial
+                .write(&[SYNC_BYTE][..])
+                .context("Failed to send baudrate sync byte")?;
+            let mut buf = [0u8];
+            info!("waiting for bootloader response");
+            serial
+                .read(&mut buf[..])
+                .context("Failed to read response from bootloader")?;
+
+            Ok(AN3155 { serial })
         }
     }
 
-    /// Standard erase command
-    pub fn standard_erase(&mut self, pages: &[u8]) -> anyhow::Result<()> {
-        info! {"erasing {} pages with standard erase command", pages.len()};
-        if pages.is_empty() {
-            warn! {"no pages to erase, doing nothing"};
-            return Ok(());
-        }
-
-        if pages.len() > MAX_ERASE_PAGE_COUNT {
-            return Err(Error::ErasePageCount(pages.len()).into());
-        }
-
-        let n = (pages.len() - 1) as u8;
-        let checksum = pages.iter().fold(n, |acc, page| acc ^ page);
-        self.write_command(BootloaderCommand::Erase)?;
-
-        debug! {"sending number of pages to erase"};
-        self.write(&[n][..])?;
-        debug! {"sending list of pages to erase"};
-        self.write(pages)?;
-        debug! {"sending checksum"};
-        self.write(&[checksum][..])?;
-        self.serial.flush()?;
-
-        self.read_ack()
+    pub struct AN3155 {
+        serial: Box<dyn serialport::SerialPort>,
     }
 
-    /// Global erase with standard erase command
-    pub fn standard_global_erase(&mut self) -> anyhow::Result<()> {
-        info! {"erasing all pages with standard erase command"}
-        self.write_command(BootloaderCommand::Erase)?;
-        self.write(&[0xFF, 0x00][..])?;
-        self.serial.flush()?;
-        self.read_ack()
-    }
-
-    /// Extended erase command
-    pub fn extended_erase(&mut self, pages: &[u16]) -> anyhow::Result<()> {
-        info! {"erasing {} pages with extended erase command", pages.len()}
-        if pages.is_empty() {
-            warn! {"no pages to erase, doing nothing"};
-            return Ok(());
-        }
-        let n = pages.len() as u16;
-
-        // create a buffer with all u16 page values converted to BE bytes
-        let mut buf = Vec::with_capacity((2 * (n + 1) + 1) as usize);
-
-        // resize to hold number of pages and the pages themselves.
-        buf.resize((2 * (n + 1)) as usize, 0x00);
-
-        // insert BE number of pages here
-        buf[..2].copy_from_slice(&n.to_be_bytes()[..]);
-
-        // Then insert pages
-        pages
-            .iter()
-            .zip(buf[2..].chunks_mut(2))
-            .for_each(|(page, chunk)| chunk.copy_from_slice(&page.to_be_bytes()[..]));
-
-        self.write_command(BootloaderCommand::ExtendedErase)?;
-        self.write_with_checksum(&buf)?;
-        self.serial.flush()?;
-        self.read_ack()
-    }
-
-    /// Global erase with standard erase command
-    pub fn extended_global_erase(&mut self, bank: BankErase) -> anyhow::Result<()> {
-        let buf = match bank {
-            BankErase::Global => &[0xFF, 0xFF, 0x00][..],
-            BankErase::Bank1 => &[0xFF, 0xFE, 0x01][..],
-            BankErase::Bank2 => &[0xFF, 0xFD, 0x02][..],
-        };
-
-        self.write_command(BootloaderCommand::ExtendedErase)?;
-        self.write(buf)?;
-        self.serial.flush()?;
-        self.read_ack()
-    }
-
-    pub fn write_memory(&mut self, address: u32, bytes: &[u8]) -> anyhow::Result<()> {
-        info! {"writing {} bytes to memory starting at address: {:08X}", bytes.len(), address};
-        if bytes.is_empty() {
-            warn! {"no bytes to write, doing nothing"};
-            return Ok(());
+    #[cfg_attr(test, automock)]
+    impl AN3155 {
+        fn write(&mut self, bytes: &[u8]) -> anyhow::Result<usize> {
+            debug!("sending {} bytes: {:02X?}", bytes.len(), bytes);
+            self.serial
+                .write(bytes)
+                .context("Failed to write data to serial port")
         }
 
-        if bytes.len() > MAX_WRITE_BYTES_COUNT {
-            return Err(Error::WriteBytesCount(bytes.len()).into());
-        }
-        let address_as_bytes = address.to_be_bytes();
+        /// Write a bootloader command and wait for a response
+        fn write_command(&mut self, command: BootloaderCommand) -> anyhow::Result<()> {
+            let buf = [command as u8, !(command as u8)];
+            debug!("sending command {:?}: {:02X?}", command, &buf[..]);
+            let n = self.write(&buf[..]).context("Failed to write command")?;
+            if n != 2 {
+                return Err(IoError::from(IoErrorKind::WriteZero).into());
+            }
 
-        self.write_command(BootloaderCommand::WriteMemory)?;
-        self.write_with_checksum(&address_as_bytes[..])?;
-        self.serial.flush()?;
-        self.read_ack()?;
-
-        let n = bytes.len() as u8 - 1;
-        let checksum = bytes.iter().fold(n, |acc, b| acc ^ b);
-        self.write(&[n][..])?;
-        self.write(bytes)?;
-        self.write(&[checksum][..])?;
-        self.read_ack()
-    }
-
-    pub fn read_memory(&mut self, address: u32, bytes: &mut [u8]) -> anyhow::Result<()> {
-        info! {"reading {} bytes to memory starting at address: {:08X}", bytes.len(), address};
-        if bytes.is_empty() {
-            warn! {"no bytes to read, doing nothing"};
-            return Ok(());
+            self.read_ack()
         }
 
-        if bytes.len() > MAX_READ_BYTES_COUNT {
-            return Err(Error::WriteBytesCount(bytes.len()).into());
+        fn write_with_checksum(&mut self, bytes: &[u8]) -> anyhow::Result<usize> {
+            let chksum = bytes.iter().fold(0u8, |acc, b| acc ^ *b);
+            let n = self.write(bytes)?;
+            debug!("sending checksum value: {:02X}", chksum);
+            let _ = self
+                .serial
+                .write(&[chksum][..])
+                .context("Failed to write checksum")?;
+            Ok(n + 1)
         }
-        let address_as_bytes = address.to_be_bytes();
 
-        self.write_command(BootloaderCommand::WriteMemory)?;
-        self.write_with_checksum(&address_as_bytes[..])?;
-        self.serial.flush()?;
-        self.read_ack()?;
+        fn read(&mut self, buf: &mut [u8]) -> anyhow::Result<usize> {
+            let n = self
+                .serial
+                .read(buf)
+                .context("Failed to read from serialport")?;
+            debug! {"read {} bytes: {:02X?}", n, &buf[..n]};
+            Ok(n)
+        }
 
-        let n = bytes.len() as u8 - 1;
-        let checksum = !n;
-        let mut buf: Vec<u8> = Vec::with_capacity((n + 1) as usize);
-        buf.resize((n + 1) as usize, 0);
-        self.write(&[n][..])?;
-        self.write(&[checksum][..])?;
-        self.serial.flush()?;
+        fn read_exact(&mut self, buf: &mut [u8]) -> anyhow::Result<()> {
+            debug!("reading exactly {} bytes", buf.len());
+            self.serial.read_exact(buf)?;
+            debug! {"read {} bytes: {:02X?}", buf.len(), &buf};
+            Ok(())
+        }
 
-        self.read_exact(&mut buf)?;
-        self.read_ack()
+        fn read_byte(&mut self) -> anyhow::Result<u8> {
+            let mut byte = [0u8];
+            let _ = self.read_exact(&mut byte[..])?;
+            Ok(byte[0])
+        }
+
+        fn read_ack(&mut self) -> anyhow::Result<()> {
+            debug!("reading bootloader response");
+            let byte = self.read_byte()?;
+            match Response::try_from(byte)
+                .context("Failed to read valid response from bootloader")?
+            {
+                Response::Ack => {
+                    debug!("received ACK");
+                    Ok(())
+                }
+                Response::Nack => {
+                    warn!("received NACK");
+                    Err(Error::Nack.into())
+                }
+            }
+        }
+
+        /// Get the bootloader version
+        pub fn get_version(&mut self) -> anyhow::Result<Version> {
+            info!("getting bootloader version");
+            self.write_command(BootloaderCommand::GetVersion)
+                .context("Failed to send GetVersion command")?;
+            info!("reading protocol version byte");
+            let byte = self
+                .read_byte()
+                .context("Failed to read protocol version byte")?;
+
+            info!("reading capatability bytes");
+            let mut buf = [0u8, 0u8];
+            self.read_exact(&mut buf)
+                .context("Failed to read compatability bytes")?;
+            self.read_ack()?;
+            Ok(Version::from(byte))
+        }
+
+        /// Get product ID
+        pub fn get_id(&mut self) -> anyhow::Result<u16> {
+            info!("getting product id");
+            self.write_command(BootloaderCommand::GetId)
+                .context("Failed to send GetId command")?;
+            trace! {"reading byte, expecting it to be '1'"};
+            let n = self.read_byte()? as usize;
+            // n should be 1, we expect to read two bytes here
+            if n != 1 {
+                return Err(anyhow::Error::from(Error::InvalidResponse(n as u8))
+                    .context("Expected two bytes for product ID"));
+            }
+
+            let mut buf = Vec::with_capacity(2);
+            buf.resize(2, 0);
+
+            info!("receiving PID");
+            self.read_exact(&mut buf)?;
+            Ok(u16::from_be_bytes(buf[0..2].try_into().unwrap()))
+        }
+
+        /// Get the bootloader commands
+        pub fn get_commands(&mut self) -> anyhow::Result<Vec<BootloaderCommand>> {
+            info!("getting bootloader command set");
+            self.write_command(BootloaderCommand::Get)
+                .context("Failed to send Get command")?;
+
+            let n = self
+                .read_byte()
+                .context("Failed to read protocol version byte")? as usize;
+
+            let mut buf = Vec::with_capacity(n as usize);
+            buf.resize(n + 1, 0);
+            self.read_exact(&mut buf)
+                .context("Failed to read bootloader command list")?;
+            self.read_ack()?;
+            let mut commands: Vec<BootloaderCommand> = Vec::with_capacity(buf.len() - 1);
+            for b in buf.iter().skip(1) {
+                commands.push(
+                    BootloaderCommand::try_from(*b)
+                        .context("Bootloader returned an unknown command value")?,
+                );
+            }
+            Ok(commands)
+        }
+
+        pub fn get_erase_command(&mut self) -> anyhow::Result<EraseCommand> {
+            let commands = self
+                .get_commands()
+                .context("Failed to get bootloader command list")?;
+
+            if commands.contains(&BootloaderCommand::Erase) {
+                Ok(EraseCommand::Erase)
+            } else if commands.contains(&BootloaderCommand::ExtendedErase) {
+                Ok(EraseCommand::ExtendedErase)
+            } else {
+                Err(Error::Unsupported.into())
+            }
+        }
+
+        /// Standard erase command
+        pub fn standard_erase(&mut self, pages: &[u8]) -> anyhow::Result<()> {
+            info! {"erasing {} pages with standard erase command", pages.len()};
+            if pages.is_empty() {
+                warn! {"no pages to erase, doing nothing"};
+                return Ok(());
+            }
+
+            if pages.len() > MAX_ERASE_PAGE_COUNT {
+                return Err(Error::ErasePageCount(pages.len()).into());
+            }
+
+            let n = (pages.len() - 1) as u8;
+            let checksum = pages.iter().fold(n, |acc, page| acc ^ page);
+            self.write_command(BootloaderCommand::Erase)?;
+
+            debug! {"sending number of pages to erase"};
+            self.write(&[n][..])?;
+            debug! {"sending list of pages to erase"};
+            self.write(pages)?;
+            debug! {"sending checksum"};
+            self.write(&[checksum][..])?;
+            self.serial.flush()?;
+
+            self.read_ack()
+        }
+
+        /// Global erase with standard erase command
+        pub fn standard_global_erase(&mut self) -> anyhow::Result<()> {
+            info! {"erasing all pages with standard erase command"}
+            self.write_command(BootloaderCommand::Erase)?;
+            self.write(&[0xFF, 0x00][..])?;
+            self.serial.flush()?;
+            self.read_ack()
+        }
+
+        /// Extended erase command
+        pub fn extended_erase(&mut self, pages: &[u16]) -> anyhow::Result<()> {
+            info! {"erasing {} pages with extended erase command", pages.len()}
+            if pages.is_empty() {
+                warn! {"no pages to erase, doing nothing"};
+                return Ok(());
+            }
+            let n = pages.len() as u16;
+
+            // create a buffer with all u16 page values converted to BE bytes
+            let mut buf = Vec::with_capacity((2 * (n + 1) + 1) as usize);
+
+            // resize to hold number of pages and the pages themselves.
+            buf.resize((2 * (n + 1)) as usize, 0x00);
+
+            // insert BE number of pages here
+            buf[..2].copy_from_slice(&n.to_be_bytes()[..]);
+
+            // Then insert pages
+            pages
+                .iter()
+                .zip(buf[2..].chunks_mut(2))
+                .for_each(|(page, chunk)| chunk.copy_from_slice(&page.to_be_bytes()[..]));
+
+            self.write_command(BootloaderCommand::ExtendedErase)?;
+            self.write_with_checksum(&buf)?;
+            self.serial.flush()?;
+            self.read_ack()
+        }
+
+        /// Global erase with standard erase command
+        pub fn extended_global_erase(&mut self, bank: BankErase) -> anyhow::Result<()> {
+            let buf = match bank {
+                BankErase::Global => &[0xFF, 0xFF, 0x00][..],
+                BankErase::Bank1 => &[0xFF, 0xFE, 0x01][..],
+                BankErase::Bank2 => &[0xFF, 0xFD, 0x02][..],
+            };
+
+            self.write_command(BootloaderCommand::ExtendedErase)?;
+            self.write(buf)?;
+            self.serial.flush()?;
+            self.read_ack()
+        }
+
+        pub fn write_memory(&mut self, address: u32, bytes: &[u8]) -> anyhow::Result<()> {
+            info! {"writing {} bytes to memory starting at address: {:08X}", bytes.len(), address};
+            if bytes.is_empty() {
+                warn! {"no bytes to write, doing nothing"};
+                return Ok(());
+            }
+
+            if bytes.len() > MAX_WRITE_BYTES_COUNT {
+                return Err(Error::WriteBytesCount(bytes.len()).into());
+            }
+            let address_as_bytes = address.to_be_bytes();
+
+            self.write_command(BootloaderCommand::WriteMemory)?;
+            self.write_with_checksum(&address_as_bytes[..])?;
+            self.serial.flush()?;
+            self.read_ack()?;
+
+            let n = bytes.len() as u8 - 1;
+            let checksum = bytes.iter().fold(n, |acc, b| acc ^ b);
+            self.write(&[n][..])?;
+            self.write(bytes)?;
+            self.write(&[checksum][..])?;
+            self.read_ack()
+        }
+
+        pub fn read_memory(&mut self, address: u32, bytes: &mut [u8]) -> anyhow::Result<()> {
+            info! {"reading {} bytes to memory starting at address: {:08X}", bytes.len(), address};
+            if bytes.is_empty() {
+                warn! {"no bytes to read, doing nothing"};
+                return Ok(());
+            }
+
+            if bytes.len() > MAX_READ_BYTES_COUNT {
+                return Err(Error::WriteBytesCount(bytes.len()).into());
+            }
+            let address_as_bytes = address.to_be_bytes();
+
+            self.write_command(BootloaderCommand::WriteMemory)?;
+            self.write_with_checksum(&address_as_bytes[..])?;
+            self.serial.flush()?;
+            self.read_ack()?;
+
+            let n = bytes.len() as u8 - 1;
+            let checksum = !n;
+            let mut buf: Vec<u8> = Vec::with_capacity((n + 1) as usize);
+            buf.resize((n + 1) as usize, 0);
+            self.write(&[n][..])?;
+            self.write(&[checksum][..])?;
+            self.serial.flush()?;
+
+            self.read_exact(&mut buf)?;
+            self.read_ack()
+        }
     }
 }
+
+#[double]
+pub use inner::{Builder, AN3155};
