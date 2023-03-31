@@ -407,6 +407,7 @@ impl AN3155 {
 
     /// Standard erase command
     pub fn standard_erase(&mut self, pages: &[u8]) -> anyhow::Result<()> {
+        info! {"erasing {} pages with standard erase command", pages.len()};
         if pages.is_empty() {
             warn! {"no pages to erase, doing nothing"};
             return Ok(());
@@ -433,6 +434,7 @@ impl AN3155 {
 
     /// Global erase with standard erase command
     pub fn standard_global_erase(&mut self) -> anyhow::Result<()> {
+        info! {"erasing all pages with standard erase command"}
         self.write_command(BootloaderCommand::Erase)?;
         self.write(&[0xFF, 0x00][..])?;
         self.serial.flush()?;
@@ -441,28 +443,30 @@ impl AN3155 {
 
     /// Extended erase command
     pub fn extended_erase(&mut self, pages: &[u16]) -> anyhow::Result<()> {
+        info! {"erasing {} pages with extended erase command", pages.len()}
+        if pages.is_empty() {
+            warn! {"no pages to erase, doing nothing"};
+            return Ok(());
+        }
         let n = pages.len() as u16;
-        // calulate checksum
-        let checksum = pages.iter().fold(n, |acc, b| acc ^ b);
 
-        // create a buffer with all u16 page values converted to
-        // BE bytes
+        // create a buffer with all u16 page values converted to BE bytes
         let mut buf = Vec::with_capacity((2 * (n + 1) + 1) as usize);
-        buf.resize((2 * (n + 1) + 1) as usize, 0x00);
+
+        // resize to hold number of pages and the pages themselves.
+        buf.resize((2 * (n + 1)) as usize, 0x00);
+
         // insert BE number of pages here
+        buf[..2].copy_from_slice(&n.to_be_bytes()[..]);
 
         // Then insert pages
-        buf.chunks_mut(2).enumerate().for_each(|(index, chunk)| {
-            chunk.copy_from_slice(&pages[index].to_be_bytes()[..]);
-        });
-
-        // then insert checksum as single byte at the end
-
-        // Add checksum as BE bytes
-        buf.extend_from_slice(&checksum.to_be_bytes()[..]);
+        pages
+            .iter()
+            .zip(buf[2..].chunks_mut(2))
+            .for_each(|(page, chunk)| chunk.copy_from_slice(&page.to_be_bytes()[..]));
 
         self.write_command(BootloaderCommand::ExtendedErase)?;
-        self.write(&buf)?;
+        self.write_with_checksum(&buf)?;
         self.serial.flush()?;
         self.read_ack()
     }
