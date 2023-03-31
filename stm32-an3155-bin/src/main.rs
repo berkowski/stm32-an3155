@@ -1,7 +1,8 @@
 use anyhow::Context;
 use clap::Parser;
+#[allow(unused_imports)]
 use log::{debug, info, trace, warn};
-use std::{cmp::Ordering, fs};
+use std::{cmp::Ordering, fs, time::Duration};
 use stm32_an3155::{Builder, DEFAULT_BAUDRATE};
 
 #[derive(clap::Parser)]
@@ -19,6 +20,10 @@ struct Opt {
     #[arg(short, long)]
     skip_initialization: bool,
 
+    /// Serialport communication timeout, in milliseconds
+    #[arg(short, long, default_value_t = 1_000u64)]
+    timeout_ms: u64,
+
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -35,6 +40,10 @@ enum Command {
         /// Starting address to write firmware to
         #[arg(short, long, default_value_t = String::from("0x08000000"))]
         address: String,
+
+        /// Don't verify bytes written after flashing.
+        #[arg(short, long)]
+        skip_verification: bool,
     },
 }
 
@@ -42,7 +51,9 @@ fn main() -> anyhow::Result<()> {
     env_logger::init();
     let cli = Opt::parse();
 
-    let builder = Builder::with_port(&cli.port).and_baud_rate(cli.baud_rate);
+    let builder = Builder::with_path(&cli.port)
+        .and_baud_rate(cli.baud_rate)
+        .and_timeout(Duration::from_millis(cli.timeout_ms));
 
     let mut an3155 = match cli.skip_initialization {
         true => builder.skip_initialization(),
@@ -67,6 +78,7 @@ fn main() -> anyhow::Result<()> {
         Command::Flash {
             address: address_str,
             file,
+            skip_verification,
         } => {
             let size = fs::metadata(&file)?.len();
             let address = u32::from_str_radix(&address_str.trim_start_matches("0x"), 16)
@@ -74,7 +86,7 @@ fn main() -> anyhow::Result<()> {
             if address < stm32_an3155::DEFAULT_START_ADDRESS {
                 panic! {"Invalid starting address: {address_str}"};
             }
-            info! {"Flashing {size} bytes using file: {file} to address: {address_str}"};
+            info! {"Flashing {file} ({size} bytes) to address: {address_str}"};
 
             let pages_to_erase: Vec<u32> = {
                 let start_offset = address - stm32_an3155::DEFAULT_START_ADDRESS;
@@ -137,12 +149,14 @@ fn main() -> anyhow::Result<()> {
                 an3155.read_memory(addr, chunk)?;
             }
 
-            debug! {"comparing bytes with original file"};
-            for (byte, (original, written)) in bytes.iter().zip(buf.iter()).enumerate() {
-                match original.cmp(&written) {
-                    Ordering::Equal => continue,
-                    _ => {
-                        panic! {"Verification failed for byte #{}", byte}
+            if !skip_verification {
+                debug! {"comparing bytes with original file"};
+                for (byte, (original, written)) in bytes.iter().zip(buf.iter()).enumerate() {
+                    match original.cmp(&written) {
+                        Ordering::Equal => continue,
+                        _ => {
+                            panic! {"Verification failed for byte #{}", byte}
+                        }
                     }
                 }
             }
