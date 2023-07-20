@@ -6,7 +6,7 @@ use std::{
     io::{Read, Write},
     time::Duration,
 };
-use stm32_an3155_rs::AN3155;
+pub use stm32_an3155_rs::AN3155;
 
 pub struct Builder<'a> {
     baud_rate: Option<u32>,
