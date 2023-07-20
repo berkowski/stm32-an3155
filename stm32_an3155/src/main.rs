@@ -85,7 +85,6 @@ fn main() -> anyhow::Result<()> {
             }
             info! {"Flashing {file} ({size} bytes) to address: {address_str}"};
 
-            stm32_an3155::erase(&mut an3155, address, size)?;
             stm32_an3155::flash(&mut an3155, address, &file, skip_verification)?;
         }
     }
