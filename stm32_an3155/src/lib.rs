@@ -146,8 +146,10 @@ pub fn flash<T: Read + Write>(
     file: &str,
     skip_verification: bool,
 ) -> anyhow::Result<()> {
+    let size = fs::metadata(&file)?.len() as u32;
     let bytes = fs::read(&file)?;
-    info! {"writing {} bytes to memory", bytes.len()};
+    erase(an3155, address, size)?;
+    info! {"writing {size} bytes to memory"};
     for (index, chunk) in bytes
         .chunks(stm32_an3155_rs::MAX_WRITE_BYTES_COUNT)
         .enumerate()
