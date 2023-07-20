@@ -1,0 +1,15 @@
+[package]
+name = "stm32_an3155"
+version = "0.1.0"
+edition = "2021"
+description = "STM32 firmware flasher using USART protocol defined in AN3155"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+anyhow = "1"
+serialport = {version = "4", default-features = false}
+clap = {version = "4", features = ["derive"]}
+stm32_an3155_rs = {path = "../stm32_an3155_rs"}
+env_logger = "0.10"
+log = "0.4"

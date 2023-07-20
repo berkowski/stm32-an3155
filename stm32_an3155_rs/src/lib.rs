@@ -535,4 +535,10 @@ impl AN3155 {
 
         self.read_exact(bytes)
     }
+
+    pub fn write_unprotect(&mut self) -> anyhow::Result<()> {
+        info! {"disabling FLASH memory write protection"};
+        self.write_command(BootloaderCommand::WriteUnprotect)?;
+        self.read_ack()
+    }
 }

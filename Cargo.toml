@@ -1,2 +1,2 @@
 [workspace]
-members = ["stm32-an3155", "stm32-an3155-bin"]
+members = ["stm32_an3155_rs", "stm32_an3155"]
