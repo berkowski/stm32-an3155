@@ -4,12 +4,12 @@ use thiserror::Error as ThisError;
 
 use std::{
     convert::TryFrom,
-    io::{Error as IoError, ErrorKind as IoErrorKind},
+    io::{Error as IoError, ErrorKind as IoErrorKind, Read, Write},
     time::Duration,
 };
 
 /// Baudrate sync byte used during initialization
-const SYNC_BYTE: u8 = 0x7F;
+pub const SYNC_BYTE: u8 = 0x7F;
 
 /// Default baud rate
 pub const DEFAULT_BAUDRATE: u32 = 57_600;
@@ -184,78 +184,15 @@ impl From<u8> for Version {
     }
 }
 
-pub struct Builder<'a> {
-    baud_rate: Option<u32>,
-    timeout: Option<Duration>,
-    path: &'a str,
+pub struct AN3155<T: Read + Write> {
+    serial: T,
 }
 
-impl<'a> Builder<'a> {
-    pub fn with_path(path: &'a str) -> Self {
-        Self {
-            path,
-            baud_rate: None,
-            timeout: None,
-        }
+impl<T: Read + Write> AN3155<T> {
+    pub fn with(serial: T) -> Self {
+        Self { serial }
     }
 
-    pub fn and_baud_rate(mut self, baud_rate: u32) -> Self {
-        self.baud_rate.replace(baud_rate);
-        self
-    }
-
-    pub fn and_timeout(mut self, timeout: Duration) -> Self {
-        self.timeout.replace(timeout);
-        self
-    }
-
-    fn build_serialport(self) -> anyhow::Result<Box<dyn serialport::SerialPort>> {
-        let path = self.path;
-        let baud_rate = self.baud_rate.unwrap_or(DEFAULT_BAUDRATE);
-        info!("opening serial port: {path} {baud_rate} 8E1");
-        serialport::new(path, baud_rate)
-            .parity(serialport::Parity::Even)
-            .stop_bits(serialport::StopBits::One)
-            .data_bits(serialport::DataBits::Eight)
-            .timeout(self.timeout.unwrap_or(Duration::from_secs(1)))
-            .open()
-            .context("Failed to open serialport device")
-    }
-
-    /// Skip bootloader comms initialization
-    ///
-    /// This can be useful if you've already communicated with
-    /// the bootloader and need to send new commands.  To be
-    /// successful you must use the same baud rate as the
-    /// original session
-    pub fn skip_initialization(self) -> anyhow::Result<AN3155> {
-        let serial = self.build_serialport()?;
-        Ok(AN3155 { serial })
-    }
-
-    /// Initialize comms with the bootloader
-    pub fn initialize(self) -> anyhow::Result<AN3155> {
-        let mut serial = self.build_serialport()?;
-
-        info!("writing baudrate sync byte");
-        serial
-            .write(&[SYNC_BYTE][..])
-            .context("Failed to send baudrate sync byte")?;
-        let mut buf = [0u8];
-        info!("waiting for bootloader response");
-        serial
-            .read(&mut buf[..])
-            .context("Failed to read response from bootloader")?;
-
-        Ok(AN3155 { serial })
-    }
-}
-
-pub struct AN3155 {
-    serial: Box<dyn serialport::SerialPort>,
-}
-
-impl AN3155 {
     fn write(&mut self, bytes: &[u8]) -> anyhow::Result<usize> {
         debug!("sending {} bytes: {:02X?}", bytes.len(), bytes);
         self.serial

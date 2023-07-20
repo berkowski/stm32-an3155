@@ -13,3 +13,11 @@ clap = {version = "4", features = ["derive"]}
 stm32_an3155_rs = {path = "../stm32_an3155_rs"}
 env_logger = "0.10"
 log = "0.4"
+
+[lib]
+name = "stm32_an3155"
+path = "src/lib.rs"
+
+[[bin]]
+name = "stm32_an3155_bin"
+path = "src/main.rs"
